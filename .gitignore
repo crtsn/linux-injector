@@ -30,3 +30,8 @@
 
 # Debug files
 *.dSYM/
+
+dummy
+injector
+print
+*.bin
