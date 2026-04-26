@@ -1,11 +1,64 @@
-//=====================================================//
-// Copyright (c) 2015, Dan Staples (https://disman.tl) //
-//=====================================================//
-
-#include "inject.h"
-#include "debug.h"
+#include <errno.h>
+#include <malloc.h>
+#include <sched.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+
+#define EIP(R) (R)->rip
+#define EAX(R) (R)->rax
+#define USER_EAX offsetof(struct user, regs.rax)
+#define ADDR2INT(R) (unsigned long long)(R)
+
+#define MAX_CODE_SIZE		128
+#define STACK_SIZE		0x1000
+#define CLONE_FLAGS		CLONE_THREAD | CLONE_SIGHAND | CLONE_UNTRACED | CLONE_VM
+#define MMAP_PROTS		PROT_READ | PROT_WRITE | PROT_EXEC
+#define MMAP_FLAGS		MAP_PRIVATE | MAP_ANONYMOUS
+
+#define MMAP_ASM "mmap64.bin"
+#define CLONE_ASM "clone64.bin"
+
+int inject_code(int pid, unsigned char *payload, size_t payload_len);
+
+int ptrace_attach(int pid);
+int ptrace_detach(int pid);
+int ptrace_getregs(int pid, struct user_regs_struct *regs);
+int ptrace_setregs(int pid, struct user_regs_struct *regs);
+int ptrace_continue(int pid, void *stop_addr);
+int ptrace_next_syscall(int pid);
+int ptrace_readmem(int pid, void *addr, unsigned char *buf, size_t len);
+int ptrace_writemem(int pid, void *addr, unsigned char *buf, size_t len);
+
+int wait_stopped(int pid);
+
+#define CHECK(A,M,...) \
+  do { \
+    if (!(A)) { \
+      fprintf(stderr, \
+	      "(%s:%d: error: %d [%s]) " M "\n", \
+	      __FILE__, \
+	      __LINE__, \
+	      errno, \
+	      errno == 0 ? "None" : strerror(errno), \
+	      ##__VA_ARGS__); \
+      errno = 0; \
+      goto error; \
+    } \
+  } while(0)
+
+// #define DEBUG_PRINTING
+#ifdef DEBUG_PRINTING
+#define dprintf(M,...) printf("[*] [%s] " M "\n", __FUNCTION__, ##__VA_ARGS__)
+#else
+#define dprintf(...)
+#endif
 
 static void
 _print_usage(void)
@@ -43,3 +96,425 @@ main(int argc, char *argv[])
 error:
   return 1;
 }
+
+struct pstate {
+  struct user_regs_struct regs;
+  size_t mem_len;
+  unsigned char mem[1];
+};
+
+static struct pstate *target_state = NULL;
+
+static int
+_save_state(int pid)
+{
+  if (!target_state) {
+    CHECK((target_state = calloc(1, sizeof(struct pstate) + MAX_CODE_SIZE - 1)),
+	  "Memory allocation error");
+    target_state->mem_len = MAX_CODE_SIZE;
+  }
+  CHECK(ptrace_getregs(pid, &target_state->regs),
+	"Failed to get registers of target process");
+  dprintf("Saved registers");
+  CHECK(ptrace_readmem(pid, (void*)EIP(&target_state->regs), target_state->mem, target_state->mem_len),
+	"Failed to read %ld bytes of memory at target process instruction pointer",
+	target_state->mem_len);
+  dprintf("Saved %ld bytes from EIP %p", target_state->mem_len, target_state->mem);
+  return 1;
+error:
+  return 0;
+}
+
+static int
+_restore_state(int pid)
+{
+  if (!target_state) return 1;
+  CHECK(ptrace_setregs(pid, &target_state->regs),
+	"Failed to set registers of target process");
+  dprintf("Restored registers");
+  CHECK(ptrace_writemem(pid, (void*)EIP(&target_state->regs), target_state->mem, target_state->mem_len),
+	"Failed to write %ld bytes of memory to target process instruction pointer",
+	target_state->mem_len);
+  dprintf("Restored %ld bytes to EIP %p", target_state->mem_len, target_state->mem);
+  free(target_state);
+  target_state = NULL;
+  return 1;
+error:
+  return 0;
+}
+
+static int
+_wait_trap(int pid)
+{
+  int status = 0;
+  while(1) {
+    CHECK(waitpid(pid, &status, 0) != -1,
+	  "waitpid error");
+    
+    if (WIFSTOPPED(status)) {
+      dprintf("Process stopped with signal %d", WSTOPSIG(status));
+    }
+    if (WIFEXITED(status)) {
+      dprintf("Process exited with signal %d", WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+      dprintf("Process terminated with signal %d", WTERMSIG(status));
+      if (WCOREDUMP(status))
+	dprintf("Process core dumped");
+    }
+    if (WIFCONTINUED(status)) {
+      dprintf("Process was resumed by delivery of SIGCONT");
+    }
+    
+    CHECK(!WIFEXITED(status), "Target process has exited");
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+      return 1;
+  }
+error:
+  return 0;
+}
+
+static int
+_mmap_data(int pid, size_t len, void *base_address, int protections, int flags, void **out)
+{
+  int ret = 0;
+  unsigned char *shellcode = NULL;
+  
+  FILE *f = fopen(MMAP_ASM, "rb");
+  CHECK(f, "Error opening " MMAP_ASM);
+  CHECK(fseek(f, 0, SEEK_END) == 0, "fseek error");
+  long shellcode_len = ftell(f);
+  CHECK(shellcode_len > 0, "ftell error");
+  // align shellcode size to 64-bit boundary
+  long shellcode_len_aligned = shellcode_len + (sizeof(void*) - (shellcode_len % sizeof(void*)));
+  CHECK(fseek(f, 0, SEEK_SET) == 0, "fseek error");
+  shellcode = malloc(shellcode_len_aligned);
+  memset(shellcode, 0x90, shellcode_len_aligned); // fill with NOPs
+  CHECK(shellcode, "malloc error");
+  size_t r = fread(shellcode, 1, shellcode_len, f);
+  CHECK(r == (size_t)shellcode_len, "fread error: %ld %ld", r, shellcode_len);
+  fclose(f);
+  
+  // get current registers
+  struct user_regs_struct orig_regs, regs = {0};
+  CHECK(ptrace_getregs(pid, &regs),
+	"Failed to get registers of target process");
+  orig_regs = regs;
+  
+  // put our arguments in the proper registers (see mmap64.asm)
+  regs.rdi = (unsigned long long)base_address;
+  regs.rsi = (unsigned long long)len;
+  regs.rdx = (unsigned long long)((protections) ? protections : MMAP_PROTS);
+  regs.r10 = (unsigned long long)((flags) ? flags : MMAP_FLAGS);
+  CHECK(ptrace_setregs(pid, &regs),
+	"Failed to set registers of target process");
+  dprintf("Wrote our shellcode parameters into process registers");
+  
+  // write mmap code to target process EIP
+  CHECK(ptrace_writemem(pid, (void*)EIP(&regs), shellcode, shellcode_len_aligned),
+	"Failed to write mmap code to target process");
+  dprintf("Wrote mmap code to EIP %p", (void*)EIP(&regs));
+  
+  // run mmap code and check return value
+  CHECK(ptrace_continue(pid, 0), "Failed to execute mmap code");
+  CHECK(_wait_trap(pid), "Error waiting for interrupt");
+  dprintf("Mmap() finished execution");
+  
+  // get return value from mmap()
+  CHECK(ptrace_getregs(pid, &regs),
+	"Failed to get registers of target process");
+  *out = (void*)EAX(&regs);
+  dprintf("Mmap() returned %p", *out);
+  CHECK(*out != MAP_FAILED, "Mmap() returned error");
+  
+  // restore registers
+  CHECK(ptrace_setregs(pid, &orig_regs),
+	"Failed to restore registers of target process");
+  dprintf("Restored registers of target process");
+  
+  ret = 1;
+error:
+  if (shellcode)
+    free(shellcode);
+  return ret;
+}
+
+static int
+_launch_payload(int pid, void *code_cave, size_t code_cave_size, void *stack_address, size_t stack_size, void *payload_address, size_t payload_len, void *payload_param, int flags)
+{
+  int ret = 0;
+  unsigned char *shellcode = NULL;
+  FILE *f = fopen(CLONE_ASM, "rb");
+  CHECK(f, "Error opening " CLONE_ASM);
+  CHECK(fseek(f, 0, SEEK_END) == 0, "fseek error");
+  long shellcode_len = ftell(f);
+  CHECK(shellcode_len > 0, "ftell error");
+  CHECK(shellcode_len <= code_cave_size, "Shellcode is too big (%ld) for allocated code cave", shellcode_len);
+  CHECK(fseek(f, 0, SEEK_SET) == 0, "fseek error");
+  shellcode = malloc(code_cave_size);
+  CHECK(shellcode, "malloc error");
+  memset(shellcode, 0x90, code_cave_size); // fill with NOPs
+  size_t r = fread(shellcode, 1, shellcode_len, f);
+  CHECK(r == (size_t)shellcode_len, "fread error: %ld %ld", r, shellcode_len);
+  fclose(f);
+  
+  // get current registers
+  struct user_regs_struct regs = {0};
+  CHECK(ptrace_getregs(pid, &regs),
+	"Failed to get registers of target process");
+  
+  // put our arguments in the proper registers (see clone64.asm)
+  regs.rax = (unsigned long long)code_cave_size;
+  regs.rdi = (unsigned long long)((flags) ? flags : CLONE_FLAGS);
+  regs.rsi = (unsigned long long)stack_address;
+  regs.rdx = (unsigned long long)stack_size;
+  regs.rcx = (unsigned long long)payload_address;
+  regs.r8  = (unsigned long long)payload_len;
+  regs.r9  = (unsigned long long)payload_param;
+  // move EIP to our code cave
+  EIP(&regs) = ADDR2INT(code_cave);
+  CHECK(ptrace_setregs(pid, &regs),
+	"Failed to set registers of target process");
+  dprintf("Wrote our shellcode parameters into process registers. EIP: %p", code_cave);
+  
+  // write shellcode to target process code cave
+  CHECK(ptrace_writemem(pid, code_cave, shellcode, code_cave_size),
+	"Failed to write clone trampoline code to target process");
+  dprintf("Wrote clone trampoline code to address %p", code_cave);
+  
+  // run shellcode and check return value
+  CHECK(ptrace_continue(pid, code_cave), "Failed to execute clone trampoline code");
+  CHECK(_wait_trap(pid), "Error waiting for interrupt");
+  dprintf("Clone() finished execution");
+  CHECK(ptrace_getregs(pid, &regs),
+	"Failed to get registers of target process");
+  dprintf("New thread ID: %lld", EAX(&regs));
+  CHECK((int)EAX(&regs) != -1, "Clone() returned error");
+  
+  // no need to restore registers, as we're about to call _restore_state()
+  
+  dprintf("Successfully launched payload");
+  
+  ret = 1;
+error:
+  if (ret == 0)
+    dprintf("Failed to launch payload");
+  if (shellcode)
+    free(shellcode);
+  return ret;
+}
+
+int
+inject_code(int pid, unsigned char *payload, size_t payload_len)
+{
+  int ret = 0, status = 0;
+  void *payload_addr = NULL,
+       *stack = NULL,
+       *code_cave = NULL,
+       *payload_aligned = NULL;
+  size_t payload_size;
+  
+  // align shellcode size to 64-bit boundary
+  payload_size = payload_len + (sizeof(void*) - (payload_len % sizeof(void*)));
+  payload_aligned = malloc(payload_size);
+  CHECK(payload_aligned, "malloc() error");
+  memset(payload_aligned, 0x90, payload_size); // fill with NOPs
+  memcpy(payload_aligned, payload, payload_len);
+  
+  printf("Injecting into target process %d\n", pid);
+  
+  // attach to process
+  CHECK(ptrace_attach(pid), "Error attaching to target process %d", pid);
+  dprintf("Attached to process");
+  
+  // wait to make sure process is in ptrace-stop state before continuing, 
+  // otherwise we may inadvertently kill the process
+  CHECK(wait_stopped(pid), "Failed to wait until target process in stopped state");
+  dprintf("Process is in stopped state");
+  
+  // Wait until process has just returned from a system call before proceeding
+  CHECK(ptrace_next_syscall(pid), "Failed to wait until after next syscall");
+  dprintf("Process exited from syscall");
+  
+  // save state
+  CHECK(_save_state(pid), "Failed to state target process state");
+  dprintf("Saved state of target process");
+  
+  // allocate payload space
+  CHECK(_mmap_data(pid, payload_size, NULL, 0, 0, &payload_addr),
+	"Failed to allocate space for payload");
+  dprintf("Allocated space for payload at location %p", payload_addr);
+
+  // copy payload
+  CHECK(ptrace_writemem(pid, payload_addr, payload_aligned, payload_size),
+	"Failed to copy payload to target process");
+  dprintf("Wrote payload to target process at address %p", payload_addr);
+  
+  // allocate new stack
+  CHECK(_mmap_data(pid, STACK_SIZE, NULL, 0, 0, &stack),
+	"Failed to allocate space for new stack");
+  stack += STACK_SIZE; // use top address as stack base, since stack grows downward
+  dprintf("Allocated new stack at location %p", stack);
+  
+  // allocate space for code cave
+  CHECK(_mmap_data(pid, MAX_CODE_SIZE, NULL, 0, 0, &code_cave),
+	"Failed to allocate space for code cave");
+  dprintf("Allocated space for code cave at location %p", code_cave);
+  
+  // launch payload via clone(2)
+  dprintf("Launching payload in new thread");
+  CHECK(_launch_payload(pid, code_cave, MAX_CODE_SIZE, stack, STACK_SIZE, payload_addr, payload_size, NULL, 0),
+	"Failed to launch payload");
+  
+  ret = 1;
+error:
+  if (payload_aligned)
+    free(payload_aligned);
+  _restore_state(pid);
+  ptrace_detach(pid);
+  return ret;
+}
+
+int
+ptrace_attach(int pid)
+{
+  CHECK(ptrace(PTRACE_ATTACH, (pid_t)pid, NULL, NULL) == 0,
+	"Failed to attach to target process %d", pid);
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_detach(int pid)
+{
+  CHECK(ptrace(PTRACE_DETACH, (pid_t)pid, NULL, NULL) == 0,
+	"Failed to detach to target process %d", pid);
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_getregs(int pid, struct user_regs_struct *regs)
+{
+  CHECK(ptrace(PTRACE_GETREGS, (pid_t)pid, NULL, regs) == 0,
+	"Failed to get registers of target process %d", pid);
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_setregs(int pid, struct user_regs_struct *regs)
+{
+  CHECK(ptrace(PTRACE_SETREGS, (pid_t)pid, NULL, regs) == 0,
+	"Failed to set registers of target process %d", pid);
+  return 1;
+error:
+  return 0;
+}
+
+int
+wait_stopped(int pid)
+{
+  int status = 0;
+  while(1) {
+    CHECK(waitpid(pid, &status, 0) != -1,
+	  "waitpid error");
+    
+    if (WIFSTOPPED(status)) {
+      dprintf("Process stopped with signal %d", WSTOPSIG(status));
+    }
+    if (WIFEXITED(status)) {
+      dprintf("Process exited with signal %d", WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+      dprintf("Process terminated with signal %d", WTERMSIG(status));
+      if (WCOREDUMP(status))
+	dprintf("Process core dumped");
+    }
+    if (WIFCONTINUED(status)) {
+      dprintf("Process was resumed by delivery of SIGCONT");
+    }
+    
+    CHECK(!WIFEXITED(status), "Target process has exited");
+    if (WIFSTOPPED(status))
+      break;
+  }
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_next_syscall(int pid)
+{
+  struct user_regs_struct regs = {0};
+  long eax;
+  do {
+    CHECK(ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == 0,
+	  "Failed to continue execution until next syscall enter/exit");
+    CHECK(wait_stopped(pid), "Failed to wait until target process in stopped state");
+    errno = 0;
+    eax = ptrace(PTRACE_PEEKUSER, pid, USER_EAX, NULL);
+    CHECK(errno == 0, "Failed to read EAX of target process");
+    dprintf("EAX after syscall: %ld", eax);
+  } while (eax == -ENOSYS); // RAX/EAX == -ENOSYS means just entered a syscall, != -ENOSYS means just exited syscall (offsetof(struct user, regs.orig_eax) can be used to see syscall number if you want)
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_continue(int pid, void *stop_addr)
+{
+  dprintf("Continuing execution of target process %d", pid);
+  CHECK(ptrace(PTRACE_CONT, (pid_t)pid, NULL, NULL) == 0,
+        "Failed to continue execution of target process %d", pid);
+  return 1;
+error:
+  return 1;
+}
+
+int
+ptrace_readmem(int pid, void *addr, unsigned char *buf, size_t len)
+{
+  CHECK(len % sizeof(void*) == 0, "Length of memory to read must be word-aligned");
+  
+  size_t wordlen = len / sizeof(void*);
+  void **wordbuf = (void**)buf;
+  
+  errno = 0;
+  for (size_t i = 0; i < wordlen; i++) {
+    wordbuf[i] = (void*)ptrace(PTRACE_PEEKDATA, (pid_t)pid, addr + (i * sizeof(void*)), NULL);
+    CHECK(errno == 0, 
+	  "Failed to read memory of target process %d at location %p", 
+	  pid, 
+	  addr + (i * sizeof(void*)));
+  }
+  return 1;
+error:
+  return 0;
+}
+
+int
+ptrace_writemem(int pid, void *addr, unsigned char *buf, size_t len)
+{
+  CHECK(len % sizeof(void*) == 0, "Length of memory to read must be word-aligned");
+  
+  size_t wordlen = len / sizeof(void*);
+  void **wordbuf = (void**)buf;
+  
+  for (size_t i = 0; i < wordlen; i++) {
+    long result = ptrace(PTRACE_POKEDATA, (pid_t)pid, addr + (i * sizeof(void*)), wordbuf[i]);
+    CHECK(result == 0, 
+	  "Failed to write memory to target process %d at location %p", 
+	  pid, 
+	  addr + (i * sizeof(void*)));
+  }
+  return 1;
+error:
+  return 0;
+}
+

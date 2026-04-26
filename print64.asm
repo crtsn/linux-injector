@@ -20,12 +20,6 @@ start:
   syscall
   ret
   
-  ; NOTE: when running the `print` program, comment out the `ret` above, and uncomment the exit instructions below
-;   xor		rax,rax
-;   mov		al,SYS_EXIT
-;   xor		rdi,rdi
-;   syscall
-
 mystring_addr:
   call @b
 mystring: db "hello from shellcode land!",0xa
