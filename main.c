@@ -22,8 +22,14 @@
 #define MMAP_PROTS		PROT_READ | PROT_WRITE | PROT_EXEC
 #define MMAP_FLAGS		MAP_PRIVATE | MAP_ANONYMOUS
 
-#define MMAP_ASM "mmap64.bin"
-#define CLONE_ASM "clone64.bin"
+static void mmap_start(void);
+static void mmap_end(void);
+
+static void clone_start(void);
+static void clone_end(void);
+
+static void payload_start(void);
+static void payload_end(void);
 
 int inject_code(int pid, unsigned char *payload, size_t payload_len);
 
@@ -62,32 +68,27 @@ int wait_stopped(int pid);
 static void
 _print_usage(void)
 {
-  printf("Usage: injector <target PID> <payload file>\n");
+  printf("Usage: injector <target PID>\n");
 }
 
 int
 main(int argc, char *argv[])
 {
-  if (argc != 3) {
+  if (argc != 2) {
     _print_usage();
     return 1;
   }
 
   int pid = atoi(argv[1]);
 
-  FILE *f = fopen(argv[2], "rb");
-  CHECK(f, "Error opening file %s", argv[2]);
-  CHECK(fseek(f, 0, SEEK_END) == 0, "fseek error");
-  long fsize = ftell(f);
-  CHECK(fsize > 0, "ftell error");
-  CHECK(fseek(f, 0, SEEK_SET) == 0, "fseek error");
-  unsigned char *payload = malloc(fsize);
+  size_t payload_len = (size_t)payload_end - (size_t)payload_start;
+  size_t payload_size_aligned = payload_len + (sizeof(void*) - (payload_len % sizeof(void*)));
+  unsigned char *payload = malloc(payload_size_aligned);
   CHECK(payload, "malloc error");
-  size_t r = fread(payload, 1, fsize, f);
-  CHECK(r == (size_t)fsize, "fread error: %ld %ld", r, fsize);
-  fclose(f);
+  memset(payload, 0x90, payload_size_aligned);
+  memcpy(payload, (void*)payload_start, payload_len);
 
-  CHECK(inject_code(pid, payload, fsize), "Failed to inject code into target process %d", pid);
+  CHECK(inject_code(pid, payload, payload_len), "Failed to inject code into target process %d", pid);
 
   printf("Code injection successful\n\n");
 
@@ -196,20 +197,13 @@ _mmap_data(int pid, size_t len, void *base_address, int protections, int flags, 
   int ret = 0;
   unsigned char *shellcode = NULL;
 
-  FILE *f = fopen(MMAP_ASM, "rb");
-  CHECK(f, "Error opening " MMAP_ASM);
-  CHECK(fseek(f, 0, SEEK_END) == 0, "fseek error");
-  long shellcode_len = ftell(f);
-  CHECK(shellcode_len > 0, "ftell error");
+  size_t shellcode_len = (size_t)mmap_end - (size_t)mmap_start;
   // align shellcode size to 64-bit boundary
-  long shellcode_len_aligned = shellcode_len + (sizeof(void*) - (shellcode_len % sizeof(void*)));
-  CHECK(fseek(f, 0, SEEK_SET) == 0, "fseek error");
+  size_t shellcode_len_aligned = shellcode_len + (sizeof(void*) - (shellcode_len % sizeof(void*)));
   shellcode = malloc(shellcode_len_aligned);
-  memset(shellcode, 0x90, shellcode_len_aligned); // fill with NOPs
   CHECK(shellcode, "malloc error");
-  size_t r = fread(shellcode, 1, shellcode_len, f);
-  CHECK(r == (size_t)shellcode_len, "fread error: %ld %ld", r, shellcode_len);
-  fclose(f);
+  memset(shellcode, 0x90, shellcode_len_aligned);
+  memcpy(shellcode, (void*)mmap_start, shellcode_len);
 
   // get current registers
   struct user_regs_struct orig_regs, regs = {0};
@@ -255,24 +249,18 @@ error:
   return ret;
 }
 
-  static int
+static int
 _launch_payload(int pid, void *code_cave, size_t code_cave_size, void *stack_address, size_t stack_size, void *payload_address, size_t payload_len, void *payload_param, int flags)
 {
   int ret = 0;
   unsigned char *shellcode = NULL;
-  FILE *f = fopen(CLONE_ASM, "rb");
-  CHECK(f, "Error opening " CLONE_ASM);
-  CHECK(fseek(f, 0, SEEK_END) == 0, "fseek error");
-  long shellcode_len = ftell(f);
+  size_t shellcode_len = (size_t)clone_end - (size_t)clone_start;
   CHECK(shellcode_len > 0, "ftell error");
   CHECK(shellcode_len <= code_cave_size, "Shellcode is too big (%ld) for allocated code cave", shellcode_len);
-  CHECK(fseek(f, 0, SEEK_SET) == 0, "fseek error");
   shellcode = malloc(code_cave_size);
   CHECK(shellcode, "malloc error");
   memset(shellcode, 0x90, code_cave_size); // fill with NOPs
-  size_t r = fread(shellcode, 1, shellcode_len, f);
-  CHECK(r == (size_t)shellcode_len, "fread error: %ld %ld", r, shellcode_len);
-  fclose(f);
+  memcpy(shellcode, (void*)clone_start, shellcode_len);
 
   // get current registers
   struct user_regs_struct regs = {0};
@@ -512,5 +500,116 @@ ptrace_writemem(int pid, void *addr, unsigned char *buf, size_t len)
   return 1;
 error:
   return 0;
+}
+
+__attribute__((naked, aligned(8)))
+static void
+mmap_start() {
+    __asm__ (
+        ".intel_syntax noprefix;"  // Switch to Intel syntax
+        "xor rax, rax;"
+        "mov al, 9;"               // SYS_MMAP
+        "xor		r8,r8;"            // fd
+        "xor		r9,r9;"            // offset
+        "syscall;"
+        "int3;"                    // interrupt for caller to trap
+        ".att_syntax;"             // Switch back to AT&T (good practice)
+    );
+}
+
+void
+mmap_end()
+{
+}
+
+__attribute__((naked, aligned(8)))
+static void
+clone_start() {
+__asm__ (
+        ".intel_syntax noprefix;"
+        "start:" 
+
+        "mov rsp, rsi;" // start using new stack
+
+        "push rax;"             // shellcode size
+        "lea r11, [rip]; 1: sub r11, (1b - start); push r11;" // shellcode addr
+        "push rdx;"             // stack size
+        "push rsi;"             // stack addr
+        "push r8;"              // payload size
+        "push rcx;"             // payload addr
+        "push rcx;"             // payload addr
+        "push r9;"              // payload param
+        "mov rsi, rsp;"         // update stack pointer for clone
+
+        // 5. Execute SYS_CLONE (56)
+        "mov rax, 56;"
+        "xor rdx, rdx;"         // ptid = NULL
+        "xor r10, r10;"         // ctid = NULL
+        "xor r8, r8;"           // regs = NULL
+        "syscall;"
+
+        "test rax, rax;"
+        "jz child_thread;"
+
+        // Parent: Trap back to injector
+        "int3;"
+
+    "child_thread:"
+        // 6. Child: Execute Payload
+        "pop rdi;"              // Pop r9 (parameter)
+        "pop rax;"              // Pop rcx (address)
+        "call rax;"
+
+    "cleanup:"
+        "xor rax,rax;"
+        "mov al, 11;"          // SYS_MUNMAP
+        "xor rdx,rdx;"
+        "mov dl,3;"
+    "munmap:"
+        "pop rdi;"              // Pop addr
+        "pop rsi;"              // Pop size
+        "syscall;"
+        "dec dl;"
+        "jnz munmap;"
+
+    "child_exit:"
+        "mov rax, 60;"          // SYS_EXIT
+        "xor rdi, rdi;"
+        "syscall;"
+
+        ".att_syntax;"
+    );
+}
+
+void
+clone_end()
+{
+}
+
+__attribute__((naked, aligned(8)))
+static void
+payload_start() {
+    __asm__ (
+        ".intel_syntax noprefix;"  // Switch to Intel syntax
+        "jmp get_addr;"            // 1. Jump to the call
+        "output_msg:"
+        "xor rax, rax;"
+        "mov al, 1;"               // SYS_WRITE
+        "mov rdi, rax;"            // STDOUT (1)
+        "pop rsi;"                 // 3. Pop string address into RSI
+        "xor rdx, rdx;"
+        "mov dl, 27;"              // Length of string
+        "syscall;"
+        "ret;"                    // Trap to return control to injector
+        "get_addr:"
+        "call output_msg;"         // 2. Call back; pushes string address to stack
+        ".ascii \"hello from shellcode land!\\n\";"
+        ".att_syntax;"             // Switch back to AT&T (good practice)
+    );
+}
+
+void
+payload_end()
+{
 }
 
