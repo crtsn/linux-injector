@@ -1,16 +1,12 @@
 CFLAGS+=-std=c99 -D_GNU_SOURCE -g -O0 -z execstack -fno-stack-protector 
-DEPS = Makefile
 
 all: injector dummy
 
-%.o: %.c %.h $(DEPS)
-	$(CC) -fPIC -c -o $@ $< $(CFLAGS)
+injector: main.c Makefile
+	$(CC) $(CFLAGS) -fPIC -o injector main.c $(LDFLAGS)
 
-injector: main.o
-	$(CC) $(CFLAGS) -o injector main.o $(LDFLAGS)
-
-dummy: dummy.o
-	$(CC) $(CFLAGS) -o dummy $^ $(LDFLAGS)
+dummy: dummy.c Makefile
+	$(CC) $(CFLAGS) -o dummy $< $(LDFLAGS)
 
 clean:
 	rm -f injector dummy *.o

@@ -11,6 +11,8 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
+static pid_t original_pid;
+
 #define EIP(R) (R)->rip
 #define EAX(R) (R)->rax
 #define USER_EAX offsetof(struct user, regs.rax)
@@ -58,7 +60,7 @@ int wait_stopped(int pid);
     } \
   } while(0)
 
-#define DEBUG_PRINTING
+// #define DEBUG_PRINTING
 #ifdef DEBUG_PRINTING
 #define dprintf(M,...) printf("[*] [%s] " M "\n", __FUNCTION__, ##__VA_ARGS__)
 #else
@@ -74,6 +76,8 @@ _print_usage(void)
 int
 main(int argc, char *argv[])
 {
+  original_pid = getpid();
+
   if (argc != 2) {
     _print_usage();
     return 1;
@@ -611,5 +615,13 @@ payload_start() {
 void
 payload_end()
 {
+}
+
+__attribute__((constructor))
+void my_payload_entry() {
+  pid_t current_pid = getpid();
+  if (current_pid != original_pid && original_pid != 0) {
+    printf("my_payload_entry\n");
+  }
 }
 
