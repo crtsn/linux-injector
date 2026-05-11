@@ -1,4 +1,6 @@
+#include <dlfcn.h>
 #include <errno.h>
+#include <linux/limits.h>
 #include <malloc.h>
 #include <sched.h>
 #include <stddef.h>
@@ -11,7 +13,17 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
-static pid_t original_pid;
+typedef struct payload_params {
+    long dlopen_addr;
+    long dlsym_addr;
+    long dlclose_addr;
+    long dlerror_addr;
+    char entry_fn_name[64];
+    char memfd_name[128];
+    long lib_buf_addr;
+    long lib_buf_sz;
+    char target_path[64];
+} payload_params;
 
 #define EIP(R) (R)->rip
 #define EAX(R) (R)->rax
@@ -60,7 +72,7 @@ int wait_stopped(int pid);
     } \
   } while(0)
 
-// #define DEBUG_PRINTING
+#define DEBUG_PRINTING
 #ifdef DEBUG_PRINTING
 #define dprintf(M,...) printf("[*] [%s] " M "\n", __FUNCTION__, ##__VA_ARGS__)
 #else
@@ -74,10 +86,8 @@ _print_usage(void)
 }
 
 int
-main(int argc, char *argv[])
+main(int argc, char **argv, char **envp)
 {
-  original_pid = getpid();
-
   if (argc != 2) {
     _print_usage();
     return 1;
@@ -99,6 +109,40 @@ main(int argc, char *argv[])
   return 0;
 error:
   return 1;
+}
+
+const char __invoke_dynamic_linker[] __attribute__((section(".interp"))) 
+    = "/lib64/ld-linux-x86-64.so.2";
+
+/* Standard libc initialization function */
+extern int __libc_start_main(
+    int (*main) (int, char **, char **),
+    int argc,
+    char **ubp_av,
+    void (*init) (void),
+    void (*fini) (void),
+    void (*rtld_fini) (void),
+    void (*stack_end)
+);
+
+/* The manual entry point */
+__attribute__((naked))
+void
+_start(void) {
+    int argc;
+    char **argv;
+
+    // Use inline assembly to get the stack pointer arguments
+    // On x86_64: rsp points to argc, rsp+8 points to argv
+    __asm__ (
+        "mov (%%rsp), %0\n"
+        "lea 8(%%rsp), %1\n"
+        : "=r" (argc), "=r" (argv)
+    );
+
+    __libc_start_main(main, argc, argv, NULL, NULL, NULL, NULL);
+
+    // This part is never reached because __libc_start_main calls exit()
 }
 
 struct pstate {
@@ -312,7 +356,37 @@ error:
   return ret;
 }
 
-  int
+long getlibcaddr(pid_t pid) {
+    FILE *fp;
+    char filename[64];
+    char line[1024];
+    long addr = 0;
+    
+    snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+    fp = fopen(filename, "r");
+    if (fp == NULL) return 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Look for the standard libc path. 
+        // This checks for the file path at the end of the line.
+        if (strstr(line, "/libc.so") || strstr(line, "/libc-")) {
+            // We found the first occurrence (the base address)
+            sscanf(line, "%lx-", &addr);
+            break; 
+        }
+    }
+    fclose(fp);
+    return addr;
+}
+
+long getFunctionAddress(char* funcName)
+{
+	void* self = dlopen("libc.so.6", RTLD_LAZY);
+	void* funcAddr = dlsym(self, funcName);
+	return (long)funcAddr;
+}
+
+int
 inject_code(int pid, unsigned char *payload, size_t payload_len)
 {
   int ret = 0, status = 0;
@@ -329,7 +403,42 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   memset(payload_aligned, 0x90, payload_size); // fill with NOPs
   memcpy(payload_aligned, payload, payload_len);
 
-  printf("Injecting into target process %d\n", pid);
+  int mypid = getpid();
+  long mylibcaddr = getlibcaddr(mypid);
+  dprintf("Injecting from injector process %d", mypid);
+  dprintf("mylibcaddr: %p", (void *) mylibcaddr);
+	long dlopenAddr = getFunctionAddress("dlopen");
+	long dlsymAddr = getFunctionAddress("dlsym");
+	long dlcloseAddr = getFunctionAddress("dlclose");
+	long dlerrorAddr = getFunctionAddress("dlerror");
+
+  long dlopenOffset = dlopenAddr - mylibcaddr;
+  long dlsymOffset = dlsymAddr - mylibcaddr;
+  long dlcloseOffset = dlcloseAddr - mylibcaddr;
+  long dlerrorOffset = dlerrorAddr - mylibcaddr;
+
+  payload_params p = {0};
+  long targetLibcAddr = getlibcaddr(pid);
+  p.dlopen_addr = targetLibcAddr + dlopenOffset;
+  p.dlsym_addr = targetLibcAddr + dlsymOffset;
+  p.dlclose_addr = targetLibcAddr + dlcloseOffset;
+  p.dlerror_addr = targetLibcAddr + dlerrorOffset;
+  snprintf(p.memfd_name, sizeof(p.memfd_name), "payload_lib");
+  snprintf(p.entry_fn_name, sizeof(p.entry_fn_name), "my_payload_entry");
+
+  char injector_path[PATH_MAX] = {0};
+  readlink("/proc/self/exe", injector_path, PATH_MAX);
+  dprintf("injector_path: %s", injector_path);
+  FILE *f = fopen(injector_path, "rb");
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  rewind(f);
+  char *buf = malloc(sz);
+  fread(buf, 1, sz, f);
+  fclose(f);
+  dprintf("Size of binary: %zu", sz);
+
+  printf("Injecting into target process %d", pid);
 
   // attach to process
   CHECK(ptrace_attach(pid), "Error attaching to target process %d", pid);
@@ -345,6 +454,15 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   CHECK(_save_state(pid), "Failed to state target process state");
   dprintf("Saved state of target process");
 
+  // Copy the injector's binary into the target's memory
+  void *lib_buf = NULL;
+  _mmap_data(pid, sz, NULL, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, &lib_buf);
+  ptrace_writemem(pid, lib_buf, buf, sz);
+  dprintf("Allocated space for lib_buf at location %p with size: %zu", lib_buf, sz);
+
+  p.lib_buf_addr = (long) lib_buf;
+  p.lib_buf_sz = sz;
+
   // allocate payload space
   CHECK(_mmap_data(pid, payload_size, NULL, 0, 0, &payload_addr),
         "Failed to allocate space for payload");
@@ -354,6 +472,17 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   CHECK(ptrace_writemem(pid, payload_addr, payload_aligned, payload_size),
         "Failed to copy payload to target process");
   dprintf("Wrote payload to target process at address %p", payload_addr);
+
+  // allocate payload args space
+  void *remote_params_ptr = NULL;
+  CHECK(_mmap_data(pid, sizeof(payload_params), NULL, 0, 0, &remote_params_ptr),
+        "Failed to allocate space for payload args");
+  dprintf("Allocated space for payload attrs at location %p", remote_params_ptr);
+
+  // copy payload args
+  CHECK(ptrace_writemem(pid, remote_params_ptr, (void *) &p, sizeof(payload_params)),
+        "Failed to copy payload params to target process");
+  dprintf("Wrote payload attrs to target process at address %p", remote_params_ptr);
 
   // allocate new stack
   CHECK(_mmap_data(pid, STACK_SIZE, NULL, 0, 0, &stack),
@@ -368,7 +497,7 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
 
   // launch payload via clone(2)
   dprintf("Launching payload in new thread");
-  CHECK(_launch_payload(pid, code_cave, MAX_CODE_SIZE, stack, STACK_SIZE, payload_addr, payload_size, NULL, 0),
+  CHECK(_launch_payload(pid, code_cave, MAX_CODE_SIZE, stack, STACK_SIZE, payload_addr, payload_size, remote_params_ptr, 0),
         "Failed to launch payload");
 
   ret = 1;
@@ -593,23 +722,128 @@ clone_end()
 __attribute__((naked, aligned(8)))
 static void
 payload_start() {
-    __asm__ (
-        ".intel_syntax noprefix;"  // Switch to Intel syntax
-        "jmp get_addr;"            // 1. Jump to the call
-        "output_msg:"
-        "xor rax, rax;"
-        "mov al, 1;"               // SYS_WRITE
-        "mov rdi, rax;"            // STDOUT (1)
-        "pop rsi;"                 // 3. Pop string address into RSI
-        "xor rdx, rdx;"
-        "mov dl, 27;"              // Length of string
-        "syscall;"
-        "ret;"                    // Trap to return control to injector
-        "get_addr:"
-        "call output_msg;"         // 2. Call back; pushes string address to stack
-        ".ascii \"hello from shellcode land!\\n\";"
-        ".att_syntax;"             // Switch back to AT&T (good practice)
-    );
+  __asm__ (
+    ".intel_syntax noprefix;"
+    "push rbp;"
+    "mov rbp, rsp;"
+    "push rbx;"
+    "push r12;"
+    "push r13;"
+    "push r14;"
+    "push r15;"
+    
+    "mov rbx, rdi;"              // rbx = payload_params
+    "sub rsp, 256;"
+    "and rsp, -16;"              // Stack alignment for GLIBC calls
+
+    // --- 1. Create memfd ---
+    "mov rax, 319;"              // sys_memfd_create
+    "lea rdi, [rbx + 96];"       // Offset 96: memfd_name
+    "mov rsi, 1;"                // MFD_CLOEXEC
+    "syscall;"
+    "mov r12, rax;"              // r12 = fd
+
+    "test r12, r12;"
+    "js exit_fail;"
+
+    // --- 2. Write buffer to memfd ---
+    "mov r13, [rbx + 224];"      // Offset 224: lib_buf_addr
+    "mov r14, [rbx + 232];"      // Offset 232: lib_buf_sz
+    "xor r15, r15;"              // Written offset
+    
+    "write_loop:"
+    "cmp r15, r14;"
+    "jae write_done;"
+    "mov rdi, r12;"
+    "lea rsi, [r13 + r15];"
+    "mov rdx, r14;"
+    "sub rdx, r15;"
+    "mov rax, 1;"                // sys_write
+    "syscall;"
+    "test rax, rax;"
+    "js exit_fail;"
+    "jz write_done;"
+    "add r15, rax;"
+    "jmp write_loop;"
+    "write_done:"
+
+    // --- 3. Build thread-self path ---
+    "lea rdi, [rbx + 240];"      // Offset 240: target_path
+    "mov rax, 0x636f72702f;"     // "/proc"
+    "mov [rdi], rax;"
+    "mov rax, 0x657268742f;"     // "/thre"
+    "mov [rdi+5], rax;"
+    "mov rax, 0x6c65732d6461;"   // "ad-sel"
+    "mov [rdi+10], rax;"
+    "mov rax, 0x64662f66;"       // "f/fd"
+    "mov [rdi+16], rax;"
+    "mov byte ptr [rdi+20], 0x2f;" // "/"
+    
+    "add rdi, 21;"
+    "mov rax, r12;"
+    "mov rcx, 10;"
+    "xor r9, r9;"
+    "p_push: xor rdx, rdx; div rcx; add dl, 0x30; push rdx; inc r9;"
+    "test rax, rax; jnz p_push;"
+    "p_pop: pop rax; mov [rdi], al; inc rdi; dec r9; jnz p_pop;"
+    "mov byte ptr [rdi], 0;"
+
+    // --- 4. dlopen(target_path, RTLD_NOW) ---
+    "lea rdi, [rbx + 240];"      // target_path
+    "mov rsi, 2;"                // RTLD_NOW
+    "mov rax, [rbx + 0];"        // dlopen_addr
+    "call rax;"
+    "mov r13, rax;"              // handle
+
+    "test r13, r13;"
+    "jz call_dlerror;"
+
+    // --- 5. dlsym(handle, entry_fn_name) ---
+    "mov rdi, r13;"
+    "lea rsi, [rbx + 32];"       // Offset 32: entry_fn_name
+    "mov rax, [rbx + 8];"        // dlsym_addr
+    "call rax;"
+    "mov r14, rax;"              // function pointer
+
+    "test r14, r14;"
+    "jz call_dlerror;"
+
+    // --- 6. Execute ---
+    "call r14;"
+
+    // --- 7. dlclose ---
+    "mov rdi, r13;"
+    "mov rax, [rbx + 16];"       // dlclose_addr
+    "call rax;"
+    "jmp exit_clean;"
+
+    "call_dlerror:"
+    "mov rax, [rbx + 24];"       // dlerror_addr
+    "call rax;"
+    "test rax, rax; jz exit_fail;"
+    "mov rsi, rax; xor rdx, rdx;"
+    "c_lp: cmp byte ptr [rsi+rdx], 0; je p_lp; inc rdx; jmp c_lp;"
+    "p_lp: mov rdi, 2; mov rax, 1; syscall;"
+    "jmp exit_fail;"
+
+    "exit_clean:"
+    "mov rax, 0x0a4b4f5f444c;"   // "DL_OK\n"
+    "mov [rsp], rax;"
+    "mov rdi, 1; mov rsi, rsp; mov rdx, 6; mov rax, 1; syscall;"
+    "jmp payload_cleanup;"
+
+    "exit_fail:"
+    "mov rax, 0x0a5252455f444c;" // "DL_ERR\n"
+    "mov [rsp], rax;"
+    "mov rdi, 1; mov rsi, rsp; mov rdx, 7; mov rax, 1; syscall;"
+
+    "payload_cleanup:"
+    "mov rdi, r12; mov rax, 3; syscall;" // sys_close(fd)
+    "lea rsp, [rbp-40];"
+    "pop r15; pop r14; pop r13; pop r12; pop rbx; pop rbp;"
+    "ret;"
+    ".att_syntax;"
+);
 }
 
 void
@@ -617,11 +851,11 @@ payload_end()
 {
 }
 
-__attribute__((constructor))
 void my_payload_entry() {
-  pid_t current_pid = getpid();
-  if (current_pid != original_pid && original_pid != 0) {
-    printf("my_payload_entry\n");
+  printf("my_payload_entry\n");
+  while (1) {
+    printf("sleeping in payload...\n");
+    sleep(5);
   }
 }
 
