@@ -11,11 +11,11 @@ Unfortunately there was high usage of **LLM** during changing this code, but it 
 make
 ```
 
-## Included programs and files
-* **dummy**: A trivial program for injecting into. Prints a message every second, then sleeps.
-* **injector**: The main program for injecting executable code into a running process. Simply provide it with the PID of the process to inject into:
+## Included executable .c files (just for lulz, but also to keep build flags in same place for single file examples)
+* **dummy.c**: A trivial program for injecting into. Prints a message every second, then sleeps.
+* **injector.c**: The main program for injecting executable code into a running process. Simply provide it with the PID of the process to inject into:
 
-  `./injector 1234`
+  `sudo ./injector.c $(pgrep "^dummy$")`
 
 ## References
 * original repo

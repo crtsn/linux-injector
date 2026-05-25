@@ -1,3 +1,17 @@
+#if 0
+set -e
+
+TMP_BIN="./dummy"
+cleanup() {
+	# echo "Not cleaned up"
+	rm -f "$TMP_BIN"
+}
+trap cleanup EXIT INT TERM
+gcc -std=c99 -D_GNU_SOURCE -g -O0 -o "$TMP_BIN" "$0"
+"$TMP_BIN" "$@"
+exit 0
+#endif
+
 #include <dlfcn.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -6,7 +20,7 @@
 int main() {
   while (1) {
     printf("sleeping...\n");
-    sleep(10);
+    sleep(20);
   }
   return 0;
 }

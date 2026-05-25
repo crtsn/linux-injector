@@ -1,3 +1,18 @@
+#if 0
+set -e
+
+TMP_BIN="./injector"
+cleanup() {
+	rm -f "$TMP_BIN"
+}
+trap cleanup EXIT INT TERM
+gcc -std=c99 -D_GNU_SOURCE -g -O0 -z noexecstack -fno-stack-protector \
+    -fPIC -shared -Wl,-e,_start -o "$TMP_BIN" "$0"
+"$TMP_BIN" "$@"
+exit 0
+#endif
+
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <linux/limits.h>
@@ -12,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 
 typedef struct payload_params {
     long dlopen_addr;
@@ -111,7 +127,7 @@ error:
   return 1;
 }
 
-const char __invoke_dynamic_linker[] __attribute__((section(".interp"))) 
+const char __invoke_dynamic_linker[] __attribute__((section(".interp")))
     = "/lib64/ld-linux-x86-64.so.2";
 
 /* Standard libc initialization function */
@@ -129,20 +145,25 @@ extern int __libc_start_main(
 __attribute__((naked))
 void
 _start(void) {
-    int argc;
-    char **argv;
+  __asm__ (
+    "mov (%%rsp), %%rsi;"      // 2nd arg: argc (loaded from top of stack)
+    "lea 8(%%rsp), %%rdx;"     // 3rd arg: ubp_av (argv, starts 8 bytes after argc)
 
-    // Use inline assembly to get the stack pointer arguments
-    // On x86_64: rsp points to argc, rsp+8 points to argv
-    __asm__ (
-        "mov (%%rsp), %0\n"
-        "lea 8(%%rsp), %1\n"
-        : "=r" (argc), "=r" (argv)
-    );
+    "mov %%rsp, %%rax;"        // Save original stack pointer to RAX
+    "and $-16, %%rsp;"         /* Align stack to 16 bytes for ABI compliance */
 
-    __libc_start_main(main, argc, argv, NULL, NULL, NULL, NULL);
+    "sub $8, %%rsp;"           /* 8-byte alignment padding */
+    "push %%rax;"              // 7th arg: stack_end (passed via stack)
 
-    // This part is never reached because __libc_start_main calls exit()
+    "mov main@GOTPCREL(%%rip), %%rdi;" // 1st arg: main function pointer (via GOT)
+    "xor %%rcx, %%rcx;"        // 4th arg: init (NULL)
+    "xor %%r8, %%r8;"          // 5th arg: fini (NULL)
+    "xor %%r9, %%r9;"          // 6th arg: rtld_fini (NULL)
+
+    "call __libc_start_main@PLT;"
+    "hlt;"                     /* Safety halt if __libc_start_main returns */
+    ::: "memory"
+  );
 }
 
 struct pstate {
@@ -171,7 +192,6 @@ _save_state(int pid)
   if (orig_rax >= 0 && (rax == -512 || rax == -514 || rax == -513 || rax == -516)) {
       dprintf("Target interrupted in syscall %ld. Manually rewinding RIP.", orig_rax);
 
-      target_state->regs.rip -= 2; // Rewind RIP to point back exactly at the 'syscall' instruction
       target_state->regs.rax = orig_rax; // Restore the syscall number to execute it again
       target_state->regs.orig_rax = -1; // Prevent the kernel from executing its own restart logic
 
@@ -208,12 +228,12 @@ error:
   return 0;
 }
 
-  static int
+static int
 _wait_trap(int pid)
 {
   int status = 0;
   while(1) {
-    CHECK(waitpid(pid, &status, 0) != -1,
+    CHECK(waitpid(pid, &status, __WALL) != -1,
         "waitpid error");
 
     if (WIFSTOPPED(status)) {
@@ -239,7 +259,7 @@ error:
   return 0;
 }
 
-  static int
+static int
 _mmap_data(int pid, size_t len, void *base_address, int protections, int flags, void **out)
 {
   int ret = 0;
@@ -258,6 +278,12 @@ _mmap_data(int pid, size_t len, void *base_address, int protections, int flags, 
   CHECK(ptrace_getregs(pid, &regs),
       "Failed to get registers of target process");
   orig_regs = regs;
+
+  // BACK UP THE ORIGINAL BYTES
+  unsigned char *backup_bytes = malloc(shellcode_len_aligned);
+  CHECK(backup_bytes, "malloc backup error");
+  CHECK(ptrace_readmem(pid, (void*)EIP(&regs), backup_bytes, shellcode_len_aligned), 
+        "Failed to backup original memory at RIP");
 
   // put our arguments in the proper registers (see mmap64.asm)
   regs.rdi = (unsigned long long)base_address;
@@ -285,15 +311,22 @@ _mmap_data(int pid, size_t len, void *base_address, int protections, int flags, 
   dprintf("Mmap() returned %p", *out);
   CHECK(*out != MAP_FAILED, "Mmap() returned error");
 
+  // --- IMMEDIATELY RESTORE THE ORIGINAL BYTES ---
+  CHECK(ptrace_writemem(pid, (void*)EIP(&orig_regs), backup_bytes, shellcode_len_aligned), 
+        "Failed to restore original memory at RIP");
+
   // restore registers
   CHECK(ptrace_setregs(pid, &orig_regs),
       "Failed to restore registers of target process");
   dprintf("Restored registers of target process");
+  dprintf("Mmap() returned %p and memory cleanly restored!", *out);
 
   ret = 1;
 error:
   if (shellcode)
     free(shellcode);
+  if (backup_bytes)
+    free(backup_bytes);
   return ret;
 }
 
@@ -361,18 +394,18 @@ long getlibcaddr(pid_t pid) {
     char filename[64];
     char line[1024];
     long addr = 0;
-    
+
     snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
     fp = fopen(filename, "r");
     if (fp == NULL) return 0;
 
     while (fgets(line, sizeof(line), fp)) {
-        // Look for the standard libc path. 
+        // Look for the standard libc path.
         // This checks for the file path at the end of the line.
         if (strstr(line, "/libc.so") || strstr(line, "/libc-")) {
             // We found the first occurrence (the base address)
             sscanf(line, "%lx-", &addr);
-            break; 
+            break;
         }
     }
     fclose(fp);
@@ -386,6 +419,68 @@ long getFunctionAddress(char* funcName)
 	return (long)funcAddr;
 }
 
+static int get_thread_list(pid_t pid, pid_t **tids_out) {
+    char task_path[64];
+    snprintf(task_path, sizeof(task_path), "/proc/%d/task", pid);
+    
+    DIR *dir = opendir(task_path);
+    if (!dir) return -1;
+
+    int capacity = 10;
+    int count = 0;
+    pid_t *tids = malloc(capacity * sizeof(pid_t));
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue; // Skip "." and ".."
+        
+        pid_t tid = (pid_t)atoi(entry->d_name);
+        if (tid <= 0) continue;
+
+        if (count >= capacity) {
+            capacity *= 2;
+            tids = realloc(tids, capacity * sizeof(pid_t));
+        }
+        tids[count++] = tid;
+    }
+    closedir(dir);
+    
+    *tids_out = tids;
+    return count; // Returns total number of threads found
+}
+
+static int freeze_all_threads(pid_t *tids, int count, pid_t main_pid) {
+    for (int i = 0; i < count; i++) {
+        pid_t tid = tids[i];
+        
+        // Use PTRACE_ATTACH on the individual TID
+        if (ptrace(PTRACE_ATTACH, tid, NULL, NULL) < 0) {
+            // It is common for short-lived threads to die before attachment; 
+            // handle ESRCH gracefully if necessary
+            if (errno == ESRCH) continue; 
+            return 0; 
+        }
+        
+        // Wait specifically for this thread to enter the stopped state
+        if (!wait_stopped(tid)) {
+            return 0;
+        }
+        
+        // Note: For any thread that is NOT the main thread executing your 
+        // trampoline code, you DO NOT alter its registers or instructions. 
+        // Just leaving it in the PTRACE stopped state is sufficient to freeze it.
+    }
+    return 1;
+}
+
+void thaw_all_threads(pid_t *tids, int count) {
+    for (int i = 0; i < count; i++) {
+        pid_t tid = tids[i];
+        // Detach leaves the thread in a running state
+        ptrace(PTRACE_DETACH, tid, NULL, NULL);
+    }
+}
+
 int
 inject_code(int pid, unsigned char *payload, size_t payload_len)
 {
@@ -395,6 +490,16 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
        *code_cave = NULL,
        *payload_aligned = NULL;
   size_t payload_size;
+  pid_t *thread_ids = NULL;
+  int total_threads = 0;
+
+  // 1. Enumerate all running threads in the target
+  total_threads = get_thread_list(pid, &thread_ids);
+  CHECK(total_threads > 0, "Failed to parse target threads");
+
+  // 2. Freeze every thread using PTRACE_ATTACH
+  CHECK(freeze_all_threads(thread_ids, total_threads, pid), "Failed to freeze target threads");
+  dprintf("All %d threads frozen successfully.", total_threads);
 
   // align shellcode size to 64-bit boundary
   payload_size = payload_len + (sizeof(void*) - (payload_len % sizeof(void*)));
@@ -423,7 +528,10 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   p.dlsym_addr = targetLibcAddr + dlsymOffset;
   p.dlclose_addr = targetLibcAddr + dlcloseOffset;
   p.dlerror_addr = targetLibcAddr + dlerrorOffset;
-  snprintf(p.memfd_name, sizeof(p.memfd_name), "payload_lib");
+  srand(time(NULL) ^ getpid());
+  int unique_id = rand() % 10000;
+
+  snprintf(p.memfd_name, sizeof(p.memfd_name), "payload_lib_%d", unique_id);
   snprintf(p.entry_fn_name, sizeof(p.entry_fn_name), "my_payload_entry");
 
   char injector_path[PATH_MAX] = {0};
@@ -439,15 +547,6 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   dprintf("Size of binary: %zu", sz);
 
   printf("Injecting into target process %d", pid);
-
-  // attach to process
-  CHECK(ptrace_attach(pid), "Error attaching to target process %d", pid);
-  dprintf("Attached to process");
-
-  // wait to make sure process is in ptrace-stop state before continuing,
-  // otherwise we may inadvertently kill the process
-  CHECK(wait_stopped(pid), "Failed to wait until target process in stopped state");
-  dprintf("Process is in stopped state");
 
 
   // save state (which handles the syscall rollback if needed)
@@ -505,7 +604,11 @@ error:
   if (payload_aligned)
     free(payload_aligned);
   _restore_state(pid);
-  ptrace_detach(pid);
+  // detach from all secondary threads to resume the target application
+  if (thread_ids) {
+      thaw_all_threads(thread_ids, total_threads);
+      free(thread_ids);
+  }
   return ret;
 }
 
@@ -555,7 +658,7 @@ wait_stopped(int pid)
   int status = 0;
   while(1) {
     dprintf("START WAITPID %d", pid);
-    CHECK(waitpid(pid, &status, 0) != -1,
+    CHECK(waitpid(pid, &status, __WALL) != -1,
           "waitpid error");
     dprintf("STOP WAITPID %d", pid);
 
@@ -660,7 +763,7 @@ static void
 clone_start() {
 __asm__ (
         ".intel_syntax noprefix;"
-        "start:" 
+        "start:"
 
         "mov rsp, rsi;" // start using new stack
 
@@ -726,12 +829,7 @@ payload_start() {
     ".intel_syntax noprefix;"
     "push rbp;"
     "mov rbp, rsp;"
-    "push rbx;"
-    "push r12;"
-    "push r13;"
-    "push r14;"
-    "push r15;"
-    
+
     "mov rbx, rdi;"              // rbx = payload_params
     "sub rsp, 256;"
     "and rsp, -16;"              // Stack alignment for GLIBC calls
@@ -750,7 +848,7 @@ payload_start() {
     "mov r13, [rbx + 224];"      // Offset 224: lib_buf_addr
     "mov r14, [rbx + 232];"      // Offset 232: lib_buf_sz
     "xor r15, r15;"              // Written offset
-    
+
     "write_loop:"
     "cmp r15, r14;"
     "jae write_done;"
@@ -768,25 +866,48 @@ payload_start() {
     "write_done:"
 
     // --- 3. Build thread-self path ---
-    "lea rdi, [rbx + 240];"      // Offset 240: target_path
-    "mov rax, 0x636f72702f;"     // "/proc"
+    "lea rdi, [rbx + 240];"       // Offset 240: target_path
+    "mov rax, 0x636f72702f;"       // "/proc" (little endian)
     "mov [rdi], rax;"
-    "mov rax, 0x657268742f;"     // "/thre"
+    "mov rax, 0x657268742f;"       // "/thre"
     "mov [rdi+5], rax;"
-    "mov rax, 0x6c65732d6461;"   // "ad-sel"
+    "mov rax, 0x6c65732d6461;"     // "ad-sel"
     "mov [rdi+10], rax;"
-    "mov rax, 0x64662f66;"       // "f/fd"
+    "mov rax, 0x64662f66;"         // "f/fd"
     "mov [rdi+16], rax;"
     "mov byte ptr [rdi+20], 0x2f;" // "/"
-    
-    "add rdi, 21;"
-    "mov rax, r12;"
-    "mov rcx, 10;"
-    "xor r9, r9;"
-    "p_push: xor rdx, rdx; div rcx; add dl, 0x30; push rdx; inc r9;"
-    "test rax, rax; jnz p_push;"
-    "p_pop: pop rax; mov [rdi], al; inc rdi; dec r9; jnz p_pop;"
-    "mov byte ptr [rdi], 0;"
+
+    "add rdi, 21;"                 // rdi now points right after "/proc/thread-self/fd/"
+
+    // Determine how many digits the file descriptor needs
+    "mov rax, r12;"                // rax = FD
+    "mov rcx, 10;"                 // Base 10 divisor
+    "mov rsi, rdi;"                // Use rsi as a lookahead tracker to find the string end
+
+"find_end_loop:"
+    "xor rdx, rdx;"
+    "div rcx;"
+    "inc rsi;"                     // Move end pointer forward by 1 byte per digit
+    "test rax, rax;"
+    "jnz find_end_loop;"
+
+    // rsi now points exactly to where the null terminator goes
+    "mov byte ptr [rsi], 0;"
+    "mov r8, rsi;"                 // Save the end address to update rdi later
+
+    // Generate the characters in reverse (from right to left)
+    "mov rax, r12;"                // Reload the original FD
+
+"convert_loop:"
+    "xor rdx, rdx;"
+    "div rcx;"
+    "add dl, 0x30;"                // Convert remainder to ASCII digit
+    "dec rsi;"                     // Move backward from the end pointer
+    "mov [rsi], dl;"               // Write the digit string character
+    "test rax, rax;"
+    "jnz convert_loop;"
+
+    "mov rdi, r8;"                 // Advance rdi to the null-terminator for subsequent use
 
     // --- 4. dlopen(target_path, RTLD_NOW) ---
     "lea rdi, [rbx + 240];"      // target_path
@@ -809,6 +930,8 @@ payload_start() {
     "jz call_dlerror;"
 
     // --- 6. Execute ---
+	"mov rdi, r13;"              // Arg 1 (rdi) = library handle
+    "mov rsi, rbx;"              // Arg 2 (rsi) = payload_params pointer
     "call r14;"
 
     // --- 7. dlclose ---
@@ -839,8 +962,8 @@ payload_start() {
 
     "payload_cleanup:"
     "mov rdi, r12; mov rax, 3; syscall;" // sys_close(fd)
-    "lea rsp, [rbp-40];"
-    "pop r15; pop r14; pop r13; pop r12; pop rbx; pop rbp;"
+    "mov rsp, rbp;"
+    "pop rbp;"
     "ret;"
     ".att_syntax;"
 );
@@ -851,11 +974,14 @@ payload_end()
 {
 }
 
-void my_payload_entry() {
-  printf("my_payload_entry\n");
-  while (1) {
-    printf("sleeping in payload...\n");
-    sleep(5);
-  }
+void my_payload_entry(void *handle, payload_params *params) {
+    printf("my_payload_entry: %p\n", params);
+    printf("entry_fn_name: %s\n", params->entry_fn_name);
+    printf("memfd_name: %s\n", params->memfd_name);
+    printf("target_path: %s\n", params->target_path);
+    while (1) {
+        printf("sleeping in payload %s...\n", params->memfd_name);
+        sleep(5);
+    }
 }
 
